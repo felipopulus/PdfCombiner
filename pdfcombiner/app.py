@@ -8,7 +8,7 @@ from functools import lru_cache
 from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QSize, QUrl
-from PyQt6.QtGui import QIcon, QPixmap
+from PyQt6.QtGui import QIcon, QPixmap, QImageReader
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLabel,
     QListWidget,
+    QListView,
     QListWidgetItem,
     QFileDialog,
     QMessageBox,
@@ -57,71 +58,91 @@ class ThumbListWidget(QListWidget):
         super().__init__(parent)
         self.setViewMode(QListWidget.ViewMode.IconMode)
         self.setIconSize(THUMB_MAX_SIZE)
+        self.setFlow(QListView.Flow.LeftToRight)
         self.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.setMovement(QListWidget.Movement.Snap)
+        self.setMovement(QListWidget.Movement.Snap)  # Snap to grid positions during drag
         self.setWrapping(True)
-        self.setSpacing(10)
+        self.setSpacing(12)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # Make the grid spacing uniform
+        self.setUniformItemSizes(True)
+        self.setLayoutMode(QListWidget.LayoutMode.Batched)
+        # Grid background and styling
+        self.setStyleSheet("""
+            QListWidget {
+                background-color: #f5f5f5;
+                border: 1px solid #ddd;
+                padding: 8px;
+            }
+            QListWidget::item:selected {
+                background-color: #e3f2fd;
+                border: 2px solid #2196F3;
+                border-radius: 4px;
+            }
+            QListWidget::item:hover {
+                background-color: #f0f0f0;
+                border-radius: 4px;
+            }
+        """)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
-            # Accept only if at least one of the urls is a supported file
+            # External file drop
             paths = [u.toLocalFile() for u in event.mimeData().urls()]
             if any(is_supported_path(p) for p in paths):
                 event.acceptProposedAction()
                 return
+        # Internal reordering
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
+            # External file drop in progress
             event.acceptProposedAction()
             return
+        # Internal reordering
         super().dragMoveEvent(event)
 
     def dropEvent(self, event):
         if event.mimeData().hasUrls():
+            # External file drop - add files
             paths = [u.toLocalFile() for u in event.mimeData().urls()]
-            self.parent().add_files(paths)  # type: ignore[attr-defined]
+            parent = self.parent()
+            if parent and hasattr(parent, 'add_files'):
+                parent.add_files(paths)  # type: ignore[attr-defined]
             event.acceptProposedAction()
             return
+        
+        # Internal reordering - use Qt's default handler
         super().dropEvent(event)
+        
+        # Update order labels after move completes
+        parent_window = self.parent()
+        if parent_window and hasattr(parent_window, 'refresh_order_labels'):
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(10, parent_window.refresh_order_labels)  # type: ignore[attr-defined]
+    
+    def keyPressEvent(self, event):
+        # Delete key removes selected item
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            current = self.currentItem()
+            if current:
+                row = self.row(current)
+                self.takeItem(row)
+                parent_window = self.parent()
+                if parent_window and hasattr(parent_window, 'refresh_order_labels'):
+                    parent_window.refresh_order_labels()  # type: ignore[attr-defined]
+                    parent_window.statusBar().showMessage(f"Total pages: {self.count()}")  # type: ignore[attr-defined]
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
 
-class PageItemWidget(QWidget):
-    def __init__(self, page_data: PageData, thumb: QPixmap, delete_callback):
-        super().__init__()
-        self.page_data = page_data
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
-
-        self.thumb_label = QLabel()
-        self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumb_label.setFixedSize(THUMB_MAX_SIZE)
-        self.thumb_label.setPixmap(thumb.scaled(THUMB_MAX_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        layout.addWidget(self.thumb_label)
-
-        bottom = QHBoxLayout()
-        bottom.setContentsMargins(0, 0, 0, 0)
-        bottom.setSpacing(6)
-
-        self.name_label = QLabel(page_data.label)
-        self.name_label.setToolTip(page_data.label)
-        self.name_label.setWordWrap(True)
-        bottom.addWidget(self.name_label, 1)
-
-        self.del_btn = QPushButton()
-        self.del_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
-        self.del_btn.setToolTip("Remove this page")
-        self.del_btn.setFixedSize(QSize(28, 28))
-        self.del_btn.clicked.connect(delete_callback)  # type: ignore[arg-type]
-        bottom.addWidget(self.del_btn, 0)
-
-        layout.addLayout(bottom)
 
 
 class MainWindow(QMainWindow):
@@ -148,6 +169,11 @@ class MainWindow(QMainWindow):
         # List of pages
         self.list = ThumbListWidget(self)
         vbox.addWidget(self.list, 1)
+
+        # Update numbering on reorder/insert/remove
+        self.list.model().rowsMoved.connect(lambda *args: self.refresh_order_labels())
+        self.list.model().rowsRemoved.connect(lambda *args: self.refresh_order_labels())
+        self.list.model().rowsInserted.connect(lambda *args: self.refresh_order_labels())
 
         # Bottom bar with Combine button
         bottom_bar = QHBoxLayout()
@@ -183,6 +209,7 @@ class MainWindow(QMainWindow):
                 self._add_pdf(p)
             elif ext in SUPPORTED_IMAGE_EXTS:
                 self._add_image(p)
+        self.refresh_order_labels()
         self.statusBar().showMessage(f"Total pages: {self.list.count()}")
 
     def _add_pdf(self, path: str):
@@ -204,19 +231,19 @@ class MainWindow(QMainWindow):
 
     def _add_page_item(self, page_data: PageData, thumb: QPixmap):
         item = QListWidgetItem()
-        # A slightly larger size hint to accommodate label and button
-        item.setSizeHint(QSize(THUMB_MAX_SIZE.width() + 24, THUMB_MAX_SIZE.height() + 56))
+        # Set thumbnail as icon
+        item.setIcon(QIcon(thumb))
+        # Set filename as text (order number will be prepended in refresh_order_labels)
+        item.setText(page_data.label)
+        item.setToolTip(f"{page_data.label}\nPress Delete to remove")
+        # Size hint for the icon
+        item.setSizeHint(QSize(THUMB_MAX_SIZE.width() + 20, THUMB_MAX_SIZE.height() + 50))
         item.setData(Qt.ItemDataRole.UserRole, page_data)
-
-        def delete_this():
-            row = self.list.row(item)
-            if row >= 0:
-                self.list.takeItem(row)
-                self.statusBar().showMessage(f"Total pages: {self.list.count()}")
-
-        widget = PageItemWidget(page_data, thumb, delete_this)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        
         self.list.addItem(item)
-        self.list.setItemWidget(item, widget)
+        self.refresh_order_labels()
 
     def on_combine(self):
         if self.list.count() == 0:
@@ -256,6 +283,15 @@ class MainWindow(QMainWindow):
         with open(out_path, "wb") as f:
             writer.write(f)
 
+    def refresh_order_labels(self):
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            page_data = item.data(Qt.ItemDataRole.UserRole)
+            if page_data:
+                # Update text with order number
+                item.setText(f"{i + 1}. {page_data.label}")
+    
+
     @lru_cache(maxsize=32)
     def _get_reader(self, path: str) -> pypdf.PdfReader:
         return pypdf.PdfReader(path)
@@ -269,6 +305,20 @@ def is_supported_path(path: str) -> bool:
 @lru_cache(maxsize=256)
 def get_thumbnail(page_data: PageData) -> QPixmap:
     if page_data.kind == "img":
+        # Prefer QImageReader with auto orientation and color profile handling.
+        try:
+            reader = QImageReader(page_data.path)
+            reader.setAutoTransform(True)
+            qimg = reader.read()
+            if not qimg.isNull():
+                pm = QPixmap.fromImage(qimg)
+                return pm.scaled(THUMB_MAX_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        except Exception:
+            pass
+        # Fallback to QPixmap loader
+        pm = QPixmap(page_data.path)
+        if not pm.isNull():
+            return pm.scaled(THUMB_MAX_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         try:
             img = Image.open(page_data.path)
             img = _prepare_image_for_thumb(img)
